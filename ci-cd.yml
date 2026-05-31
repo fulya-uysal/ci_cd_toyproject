@@ -1,0 +1,169 @@
+# .github/workflows/ci-cd.yml
+#
+# ─────────────────────────────────────────────────────────────
+#  CI/CD PIPELINE — Learning Guide
+#  Every section has comments explaining WHY it exists.
+# ─────────────────────────────────────────────────────────────
+
+name: CI/CD Pipeline
+
+# TRIGGER: When does this pipeline run?
+# - On every push to any branch
+# - On every Pull Request targeting "main"
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+# JOBS: A pipeline is made of jobs. Jobs can run in parallel or sequentially.
+jobs:
+
+  # ── JOB 1: LINT ─────────────────────────────────────────────
+  # Linting = checking code style/quality BEFORE running tests.
+  # If code is messy, fail fast. Don't waste time running tests.
+  lint:
+    name: 🔍 Lint
+    runs-on: ubuntu-latest  # GitHub provides a free Ubuntu VM
+
+    steps:
+      # Step 1: Download your code onto the VM
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Step 2: Install Python
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Step 3: Install only the linter (fast — no need for full deps)
+      - name: Install flake8
+        run: pip install flake8
+
+      # Step 4: Run linter
+      # --max-line-length 100  → allow lines up to 100 chars
+      # --exclude .git         → skip git internals
+      - name: Run flake8
+        run: flake8 app/ tests/ --max-line-length 100 --exclude .git
+
+
+  # ── JOB 2: TEST ─────────────────────────────────────────────
+  # Tests only run AFTER lint passes (needs: [lint]).
+  # This is called a "dependency chain" — a core CI/CD concept.
+  test:
+    name: 🧪 Test
+    runs-on: ubuntu-latest
+    needs: [lint]  # ← Won't start until lint job succeeds
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Cache pip packages: if requirements.txt hasn't changed,
+      # GitHub reuses cached packages → much faster pipeline.
+      - name: Cache pip packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Run pytest with coverage report
+      # --cov=app          → measure coverage for the app/ folder
+      # --cov-report=term  → print results in the terminal log
+      - name: Run tests with coverage
+        run: pytest tests/ --cov=app --cov-report=term -v
+
+      # Upload coverage as a build artifact so you can download
+      # and inspect it later from the GitHub Actions UI.
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: .coverage
+
+
+  # ── JOB 3: BUILD ────────────────────────────────────────────
+  # Build a Docker image. Only runs if tests pass.
+  # In a real project, this image would be pushed to a registry
+  # (Docker Hub, AWS ECR, Google Artifact Registry, etc.)
+  build:
+    name: 🐳 Build Docker Image
+    runs-on: ubuntu-latest
+    needs: [test]  # ← Only if tests pass
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # Build the image. We tag it with the git commit SHA
+      # so every build is uniquely identifiable.
+      - name: Build Docker image
+        run: |
+          docker build -t my-api:${{ github.sha }} .
+          echo "✅ Built image: my-api:${{ github.sha }}"
+
+      # Smoke test: run the container and hit /health
+      # This catches runtime errors that tests might miss.
+      - name: Smoke test the container
+        run: |
+          docker run -d -p 8000:8000 --name test-container my-api:${{ github.sha }}
+          sleep 3  # wait for server to start
+          curl --fail http://localhost:8000/health
+          echo "✅ Container is healthy!"
+          docker stop test-container
+
+
+  # ── JOB 4: DEPLOY (simulated) ───────────────────────────────
+  # Only deploy when merging to main — not on feature branches.
+  # In a real project: replace the echo commands with actual
+  # deployment scripts (SSH into server, push to Fly.io, etc.)
+  deploy:
+    name: 🚀 Deploy
+    runs-on: ubuntu-latest
+    needs: [build]  # ← Only if build passes
+    if: github.ref == 'refs/heads/main'  # ← Only on main branch
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Deploy to production
+        run: |
+          echo "─────────────────────────────────────────"
+          echo "🚀 Deploying commit ${{ github.sha }}"
+          echo "   Branch: ${{ github.ref_name }}"
+          echo "   Triggered by: ${{ github.actor }}"
+          echo ""
+          echo "   [In a real project, you'd run:]"
+          echo "   - SSH into your server"
+          echo "   - Pull the new Docker image"
+          echo "   - Restart the container"
+          echo "   OR: push to Fly.io / Render / AWS ECS"
+          echo "─────────────────────────────────────────"
+          echo "✅ Deploy complete!"
+
+      # GitHub Deployments API — creates a visual deployment
+      # badge/history in your repo's GitHub UI (Environments tab).
+      - name: Create GitHub deployment
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const deployment = await github.rest.repos.createDeployment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref: context.sha,
+              environment: 'production',
+              auto_merge: false,
+              required_contexts: [],
+              description: 'Deployed via CI/CD pipeline'
+            });
+            console.log('Deployment created:', deployment.data.id);
